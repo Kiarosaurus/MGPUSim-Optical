@@ -3,18 +3,17 @@ package timingconfig
 
 import (
 	"fmt"
-	"strings"
+	"math"
+
+	"github.com/sarchlab/akita/v4/noc/networking/nvlink"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/mem/vm/mmu"
-	"github.com/sarchlab/akita/v4/noc/networking/pcie"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
 	"github.com/sarchlab/mgpusim/v4/amd/samples/runner/timingconfig/r9nano"
-
-	"github.com/sarchlab/mgpusim/v4/amd/timing/optical"
 )
 
 // Builder builds a hardware platform for timing simulation.
@@ -32,9 +31,6 @@ type Builder struct {
 	platform          *sim.Domain
 	globalStorage     *mem.Storage
 	rdmaAddressMapper *mem.BankedAddressPortMapper
-
-	opticalConnector  *optical.Connector         // Referencia al CONECTOR óptico.
-	networkController *optical.NetworkController // Referencia al CONTROLLER.
 }
 
 // MakeBuilder creates a new Builder with default parameters.
@@ -82,9 +78,9 @@ func (b Builder) Build() *sim.Domain {
 
 	gpuBuilder := b.createGPUBuilder(gpuDriver, mmuComp) // Constructor de GPU a partir del paquete 'r9nano'.
 
-	// Crea el conector PCIe, el Root Complex (punto de origen de PCIe en la CPU),
-	// y la red PCIe a la que se conectarán las GPUs.
-	pcieConnector, rootComplexID :=
+	// Crea el conector NVLINK, el Root Complex (punto de origen en la CPU),
+	// y la red híbrida a la que se conectarán las GPUs.
+	nvConnector, rootComplexID :=
 		b.createConnection(gpuDriver, mmuComp)
 
 	mmuComp.MigrationServiceProvider = gpuDriver.GetPortByName("MMU").AsRemote()
@@ -92,12 +88,11 @@ func (b Builder) Build() *sim.Domain {
 	b.createRDMAAddrTable()
 	pmcAddressTable := b.createPMCPageTable()
 
-	b.createGPUs( // Se crean e interconectan las GPUs según la lógica definida.
-		rootComplexID, pcieConnector,
+	b.createGPUs( // Se crean e interconectan las GPUs formando nuestra Malla 2D (Mesh)
+
+		rootComplexID, nvConnector,
 		gpuBuilder, gpuDriver,
 		pmcAddressTable)
-
-	pcieConnector.EstablishRoute()
 
 	return b.platform
 }
@@ -172,22 +167,90 @@ func (b *Builder) createGPUBuilder(
 
 func (b *Builder) createGPUs(
 	rootComplexID int,
-	pcieConnector *pcie.Connector,
+	nvConnector *nvlink.Connector, // Nuevo conector.
 	gpuBuilder r9nano.Builder,
 	gpuDriver *driver.Driver,
 	pmcAddressTable *mem.BankedAddressPortMapper,
 ) {
+	// 1. Dimensiones de la topología Mesh 2D (dinámico).
+	numGPUsFloat := float64(b.numGPUs)
+	numCols := int(math.Ceil(math.Sqrt(numGPUsFloat)))
+	numRows := int(math.Ceil(numGPUsFloat / float64(numCols)))
 
-	// Topología de Red.
-	lastSwitchID := rootComplexID
-	for i := 1; i < b.numGPUs+1; i++ {
-		if i%2 == 1 { // Por cada 2 GPUs se crea un nuevo switch PCIe (conectado al Root Complex).
-			lastSwitchID = pcieConnector.AddSwitch(rootComplexID)
+	// Guardamos los IDs de red devueltos por nvlink.
+	gpuMatrix := make([][]int, numRows)
+	for r := range gpuMatrix {
+		gpuMatrix[r] = make([]int, numCols)
+		for c := range gpuMatrix[r] {
+			gpuMatrix[r][c] = -1 // Hueco vacío!
 		}
+	}
 
-		// Se conectan esas 2 GPUs al switch recién creado.
-		b.createGPU(i, gpuBuilder, gpuDriver, pmcAddressTable,
-			pcieConnector, lastSwitchID)
+	gpuID := 1
+	for r := 0; r < numRows; r++ {
+		for c := 0; c < numCols; c++ {
+
+			// Salir si ya hemos creado todas las GPUs
+			if gpuID > b.numGPUs {
+				break
+			}
+
+			// Creamos un switch PCIe local y lo conectamos al Root Complex de la CPU
+			pcieSwitchID := nvConnector.AddPCIeSwitch()
+			nvConnector.ConnectSwitchesWithPCIeLink(rootComplexID, pcieSwitchID)
+
+			// Creamos la GPU físicamente
+			gpu := b.createGPU(gpuID, gpuBuilder, gpuDriver, pmcAddressTable)
+
+			// !!! ENCHUFAMOS LA GPU AL ECOSISTEMA NVLINK
+			// Asigna automáticamente rutas PCIe y su propio switch NVLink
+			networkDeviceID := nvConnector.PlugInDevice(pcieSwitchID, gpu.Ports())
+
+			// Guardamos el ID en la cuadrícula
+			gpuMatrix[r][c] = networkDeviceID
+			gpuID++
+		}
+	}
+
+	// 2. Construimos los enlaces del Mesh 2D
+	b.buildNVLinkMesh(nvConnector, gpuMatrix, numRows, numCols)
+
+	// 3. Calculamos todas las rutas de la red
+	nvConnector.EstablishRoute()
+}
+
+// Aprovechando el modelado de topología directo.
+// En clústeres de >100 GPUs se usaría NVLink 5 Switch.
+// El Switch soporta hasta 576 GPU con conexión directa.
+func (b *Builder) buildNVLinkMesh(nvConnector *nvlink.Connector, gpuMatrix [][]int, numRows, numCols int) {
+	// Nro de cables NVLink que unen dos GPUs.
+	// NVLink 4ta generación soporta 18 enlaces por GPU.
+	// Como cada GPU tiene hasta 4 vecinos, aumentaremos a 4.
+	// https://www.nvidia.com/es-la/data-center/nvlink/
+	numLinks := 4
+
+	// Filas
+	for r := 0; r < numRows; r++ {
+		for c := 0; c < numCols-1; c++ {
+			idA := gpuMatrix[r][c]
+			idB := gpuMatrix[r][c+1]
+
+			if idA != -1 && idB != -1 { // Ignorar huecos
+				nvConnector.ConnectDevicesWithNVLink(idA, idB, numLinks)
+			}
+		}
+	}
+
+	// Columnas
+	for c := 0; c < numCols; c++ {
+		for r := 0; r < numRows-1; r++ {
+			idA := gpuMatrix[r][c]
+			idB := gpuMatrix[r+1][c]
+
+			if idA != -1 && idB != -1 {
+				nvConnector.ConnectDevicesWithNVLink(idA, idB, numLinks)
+			}
+		}
 	}
 }
 
@@ -207,81 +270,24 @@ func (b *Builder) createRDMAAddrTable() *mem.BankedAddressPortMapper {
 
 func (b *Builder) createConnection(
 	gpuDriver *driver.Driver,
-	mmuComponent *mmu.Comp,
-) (*pcie.Connector, int) {
-	// Utiliza un pcie.Connector para modelar una red PCIe versión 4 con 16 lanes
-	// (WithVersion(4, 16)) y una latencia de switch de 140 ciclos (WithSwitchLatency(140)).
-
-	// connection := sim.NewDirectConnection(engine)
-	// connection := noc.NewFixedBandwidthConnection(32, engine, 1*sim.GHz)
-	// connection.SrcBufferCapacity = 40960000
-	pcieConnector := pcie.NewConnector().
+	mmuComp *mmu.Comp,
+) (*nvlink.Connector, int) {
+	// 1. Inicializamos el conector (PCIe + NVLink + Ethernet)
+	nvConnector := nvlink.NewConnector().
 		WithEngine(b.simulation.GetEngine()).
-		WithVersion(4, 16).
-		WithSwitchLatency(140)
+		WithFrequency(1 * sim.GHz)
 
-	pcieConnector.CreateNetwork("PCIe")
+	// 2. Creamos la red base
+	nvConnector.CreateNetwork("Supercomputer_Fabric")
 
-	// Creación del Root Complex que conecta los puertos del driver y de la MMU.
-	rootComplexID := pcieConnector.AddRootComplex(
+	// 3. Añadimos la CPU (Root Complex) a la red
+	rootComplexID := nvConnector.AddRootComplex(
 		[]sim.Port{
-			gpuDriver.GetPortByName("GPU"),
-			gpuDriver.GetPortByName("MMU"),
-			mmuComponent.GetPortByName("Migration"),
-			mmuComponent.GetPortByName("Top"),
+			gpuDriver.GetPortByName("CPU"),
+			mmuComp.GetPortByName("Migration"),
 		})
 
-	// --- RED ÓPTICA ---
-	// No necesitamos crear un "Root Complex" óptico porque es P2P.
-	fmt.Println("[DEBUG_BUILDER] Creating Optical Network...")
-
-	// 1. Instanciar Connector (Switch + Link).
-	b.opticalConnector = optical.NewConnector(b.simulation)
-	b.simulation.RegisterComponent(b.opticalConnector.Switch)
-
-	found := false
-	for _, c := range b.simulation.Components() {
-		if c.Name() == "OpticalSwitch" {
-			found = true
-			break
-		}
-	}
-	if found {
-		fmt.Println("[DEBUG_BUILDER] ÉXITO: OpticalSwitch ENCONTRADO en la lista de componentes.")
-	} else {
-		fmt.Println("[DEBUG_BUILDER] ERROR: OpticalSwitch NO ENCONTRADO en la lista de componentes.")
-	}
-
-	// 2. Instanciar Predictor.
-	Predictor := &optical.MaxTrafficPredictor{}
-
-	// 3. Instanciar Controlador.
-	// Frecuencia: 100 KHz = Revisa cada 10 microsegs.
-	b.networkController = optical.NewNetworkController(
-		"OpticalController",
-		b.simulation.GetEngine(),
-		b.opticalConnector.Switch,
-		Predictor,
-		b.opticalConnector.AllLinks,
-		100*sim.KHz,
-	)
-	b.simulation.RegisterComponent(b.networkController)
-	fmt.Println("[DEBUG_BUILDER] Optical Network created.")
-
-	found = false
-	for _, c := range b.simulation.Components() {
-		if c.Name() == "OpticalController" {
-			found = true
-			break
-		}
-	}
-	if found {
-		fmt.Println("[DEBUG_BUILDER] ÉXITO: OpticalController ENCONTRADO en la lista de componentes.")
-	} else {
-		fmt.Println("[DEBUG_BUILDER] ERROR: OpticalController NO ENCONTRADO en la lista de componentes.")
-	}
-
-	return pcieConnector, rootComplexID
+	return nvConnector, rootComplexID
 }
 
 func (b *Builder) createRDMAAddressMapper() {
@@ -296,11 +302,9 @@ func (b *Builder) createGPU(
 	gpuBuilder r9nano.Builder, // Utiliza la plantilla de 'r9nano' para construir un GPU con nombre y ID único.
 	gpuDriver *driver.Driver,
 	pmcAddressTable *mem.BankedAddressPortMapper,
-	pcieConnector *pcie.Connector,
-	pcieSwitchID int,
 ) *sim.Domain {
 	name := fmt.Sprintf("GPU[%d]", index)
-	memAddrOffset := uint64(index) * b.gpuMemSize // Dinámico!
+	memAddrOffset := uint64(index) * 4 * mem.GB // Asigna un desplazamiento de dirección de memoria
 	gpu := gpuBuilder.
 		WithGPUID(uint64(index)).
 		WithMemAddrOffset(memAddrOffset).
@@ -311,43 +315,18 @@ func (b *Builder) createGPU(
 		gpu.GetPortByName("CommandProcessor"),
 		driver.DeviceProperties{
 			CUCount:  b.numCUPerSA * b.numSAPerGPU,
-			DRAMSize: b.gpuMemSize,
+			DRAMSize: 4 * mem.GB,
 		},
 	)
 	// gpu.CommandProcessor.Driver = gpuDriver.GetPortByName("GPU")
 
 	b.configRDMAEngine(gpu)
-	b.configPMC(gpu, gpuDriver, pmcAddressTable)
+	// b.configPMC(gpu, gpuDriver, pmcAddressTable)
 
-	// pcieConnector.PlugInDevice(pcieSwitchID, gpu.Ports())
+	// Necesitamos capturar el deviceID que returnea el conector al enchufar la GPU.
+	//pcieConnector.PlugInDevice(pcieSwitchID, gpu.Ports())
 
-	// 1. Obtenemos TODOS los puertos de la GPU.
-	ports := gpu.Ports()
-	var pciePorts []sim.Port
-
-	fmt.Printf("[DEBUG_BUILDER] Configurando puertos para GPU %d:\n", index)
-
-	// 2. Clasificamos los puertos por red:
-	// [1] Control (PCIe) o [2] Datos (Óptico).
-	for _, p := range ports {
-		fmt.Printf("   - Puerto analizado: '%s' -> ", p.Name())
-
-		// En r9nano/builder.go los puertos del RDMA son:
-		isRDMAReq := strings.Contains(p.Name(), "RDMARequest")
-		isRDMAData := strings.Contains(p.Name(), "RDMAData")
-
-		if isRDMAReq || isRDMAData {
-			fmt.Println("RED ÓPTICA")
-			b.opticalConnector.PlugIn(p) // [2] Conexión a la red óptica.
-		} else {
-			fmt.Println("RED PCIE")
-			// [1] Conectar a PCIe ("CommandProcessor", "MMU", etc.)
-			pciePorts = append(pciePorts, p)
-		}
-	}
-
-	// 3. Enchufar puertos de CONTROL a su Switch PCIe.
-	pcieConnector.PlugInDevice(pcieSwitchID, pciePorts)
+	// b.gpus = append(b.gpus, gpu)
 
 	return gpu
 }
@@ -360,17 +339,15 @@ func (b *Builder) configRDMAEngine(
 		gpu.GetPortByName("RDMAData").AsRemote())
 }
 
-func (b *Builder) configPMC(
-	gpu *sim.Domain,
-	gpuDriver *driver.Driver,
-	addrTable *mem.BankedAddressPortMapper,
-) {
-	pmcPort := gpu.GetPortByName("PageMigrationController")
-
-	addrTable.LowModules = append(
-		addrTable.LowModules,
-		pmcPort.AsRemote())
-
-	gpuDriver.RemotePMCPorts = append(
-		gpuDriver.RemotePMCPorts, pmcPort)
-}
+// func (b *Builder) configPMC(
+// 	gpu *GPU,
+// 	gpuDriver *driver.Driver,
+// 	addrTable *mem.BankedAddressPortMapper,
+// ) {
+// 	gpu.PMC.RemotePMCAddressTable = addrTable
+// 	addrTable.LowModules = append(
+// 		addrTable.LowModules,
+// 		gpu.PMC.GetPortByName("Remote").AsRemote())
+// 	gpuDriver.RemotePMCPorts = append(
+// 		gpuDriver.RemotePMCPorts, gpu.PMC.GetPortByName("Remote"))
+// }

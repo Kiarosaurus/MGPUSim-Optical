@@ -12,6 +12,9 @@ type Connector struct {
 	Simulation *simulation.Simulation // Ref a la simulación completa.
 	Switch     *Switch
 	portID     int
+
+	// Listamos todos los Links.
+	AllLinks []*Link // Con esto, el Controller puede pausarlos.
 }
 
 func NewConnector(sim *simulation.Simulation) *Connector {
@@ -22,6 +25,7 @@ func NewConnector(sim *simulation.Simulation) *Connector {
 		Simulation: sim,
 		Switch:     sw,
 		portID:     0,
+		AllLinks:   make([]*Link, 0),
 	}
 }
 
@@ -45,14 +49,16 @@ func (c *Connector) PlugIn(gpuPort sim.Port) {
 	// t = 20 m / 2 x 10^8 m/s  =>  1 x 10^{-8}
 	cable := NewLink(cableName, c.Simulation.GetEngine(), 1e-8)
 
-	// 3. Registrar el Link en la simulación (para que procese eventos).
+	// 3. Guardamos la ref del Link.
+	c.AllLinks = append(c.AllLinks, cable)
+
+	// 4. Registrar el Link en la simulación (para que procese eventos).
 	c.Simulation.RegisterComponent(cable)
 
-	// 4. Conectando físicamente.
+	// 5. Conectando físicamente.
 	cable.PlugIn(gpuPort)    // Link con GPU.
 	cable.PlugIn(switchPort) // Link con Switch.
 
-	// 5. Ruta... (por ahora, estática).
-	// TODO. Hacerlo para topología reconfigurable.
+	// 6. Registramos la ruta estática + lógica inicial :D
 	c.Switch.RegisterDestination(gpuPort.AsRemote(), switchPort)
 }

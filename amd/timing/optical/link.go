@@ -3,6 +3,7 @@ package optical
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/sarchlab/akita/v4/sim"
 )
@@ -24,7 +25,15 @@ func NewLinkDeliveryEvent(time sim.VTimeInSec, handler sim.Handler, msg sim.Msg,
 
 // Metiendo un mensaje en el INPUT BUFFER del PORT DESTINO.
 func (e *LinkDeliveryEvent) Execute(engine sim.Engine) error {
-	e.DstPort.Deliver(e.Msg) // Asumimos que la cola no estará llena.
+	err := e.DstPort.Deliver(e.Msg)
+
+	if err != nil {
+		retryEvent := NewLinkDeliveryEvent(e.Time()+1e-9, e.Handler(), e.Msg, e.DstPort)
+
+		engine.Schedule(retryEvent)
+		return nil
+	}
+
 	return nil
 }
 
@@ -35,6 +44,10 @@ type Link struct {
 	SideA   sim.Port
 	SideB   sim.Port
 	Latency sim.VTimeInSec
+
+	// Estados para la reconfiguración.
+	paused     bool
+	pausedLock sync.Mutex
 }
 
 // TODO. Justo ahora la latencia es estática y el bandwidth infinito.
@@ -42,6 +55,7 @@ func NewLink(name string, engine sim.Engine, latency sim.VTimeInSec) *Link {
 	l := &Link{
 		TickingComponent: sim.NewTickingComponent(name, engine, 1*sim.GHz, nil),
 		Latency:          latency,
+		paused:           false,
 	}
 	return l
 }
@@ -54,6 +68,26 @@ func (l *Link) Handle(e sim.Event) error {
 	default: // Otra cosa = tick.
 		return l.TickingComponent.Handle(e)
 	}
+}
+
+// --- LÓGICA DE PAUSA POR RECONFIGURACIÓN ---
+
+func (l *Link) Pause() {
+	l.pausedLock.Lock()
+	defer l.pausedLock.Unlock()
+
+	l.paused = true
+	fmt.Printf("[LINK] %s Paused.\n", l.Name())
+}
+
+func (l *Link) Resume() {
+	l.pausedLock.Lock()
+	defer l.pausedLock.Unlock()
+
+	l.paused = false
+	fmt.Printf("[LINK] %s Resumed.\n", l.Name())
+
+	l.NotifySend() // Revisamos lo pendiente.
 }
 
 // --- REQUISITOS INTERFACE CONNECTION ---
@@ -81,14 +115,25 @@ func (l *Link) Unplug(port sim.Port) {
 }
 
 func (l *Link) NotifyAvailable(port sim.Port) {
-	// No-op.
+	l.NotifySend()
 }
 
 // Llamado automáticamente cuando alguien quiere enviar algo.
 func (l *Link) NotifySend() {
+	// CASO 1: HAY Reconfiguración. Pausamos.
+	// No hay call a CheckAndForward, tampoco a RetrieveOutgoing.
+	// El package queda en el componente origen.
+	l.pausedLock.Lock()
+	if l.paused {
+		l.pausedLock.Unlock()
+		return
+	}
+	l.pausedLock.Unlock()
+
+	// CASO 2: NO HAY Reconfiguración.
+	// Se tiene que revisar quién tiene algo porque no hay args.
 	now := l.Engine.CurrentTime()
 
-	// Se tiene que revisar quién tiene algo porque no hay args.
 	if l.SideA != nil {
 		l.CheckAndForward(now, l.SideA, l.SideB)
 	}
@@ -99,27 +144,30 @@ func (l *Link) NotifySend() {
 
 // --- LÓGICA DE DESEMPAQUETADO ---
 func (l *Link) CheckAndForward(now sim.VTimeInSec, src, dst sim.Port) {
-	msg := src.RetrieveOutgoing() // Extrayendo el mensaje del port origen.
-
-	if msg == nil {
-		return
-	}
-
 	if dst == nil {
 		fmt.Printf("[LINK_ERROR] %s: Destination not connected.\n", l.Name())
 		return
 	}
 
-	msgToDeliver := msg
+	// Procesar todos los mensajes pendientes.
+	for {
+		msg := src.RetrieveOutgoing() // Extrayendo el mensaje del port origen.
+		if msg == nil {
+			return
+		}
 
-	// Si el mensaje viene del Switch (sobre), lo abrimos.
-	if pkt, ok := msg.(*OpticalPacket); ok {
-		msgToDeliver = pkt.InnerMsg
-	} else { // Viene de la GPU (mensaje normal), lo pasamos tal cual.
-		fmt.Printf("[LINK_TRAFFIC] %s: %s -> %s (Type: %T)\n", l.Name(), src.Name(), dst.Name(), msg)
+		msgToDeliver := msg
+
+		// Si el mensaje viene del Switch (sobre), lo abrimos.
+		if pkt, ok := msg.(*OpticalPacket); ok {
+			msgToDeliver = pkt.InnerMsg
+			//} else { // Viene de la GPU (mensaje normal), lo pasamos tal cual.
+			//	fmt.Printf("[LINK_TRAFFIC] %s: %s -> %s (Type: %T)\n", l.Name(), src.Name(), dst.Name(), msg)
+		}
+
+		// Diciéndole al motor (Engine) que ejecute luego.
+		evt := NewLinkDeliveryEvent(now+l.Latency, l, msgToDeliver, dst)
+		l.Engine.Schedule(evt)
 	}
 
-	// Diciéndole al motor (Engine) que ejecute luego.
-	evt := NewLinkDeliveryEvent(now+l.Latency, l, msgToDeliver, dst)
-	l.Engine.Schedule(evt) // "Despiértenme en now+l"
 }

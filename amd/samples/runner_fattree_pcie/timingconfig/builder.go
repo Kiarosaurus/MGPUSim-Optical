@@ -3,7 +3,7 @@ package timingconfig
 
 import (
 	"fmt"
-	"strings"
+	"math"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/mem/vm"
@@ -13,8 +13,6 @@ import (
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
 	"github.com/sarchlab/mgpusim/v4/amd/samples/runner/timingconfig/r9nano"
-
-	"github.com/sarchlab/mgpusim/v4/amd/timing/optical"
 )
 
 // Builder builds a hardware platform for timing simulation.
@@ -32,9 +30,6 @@ type Builder struct {
 	platform          *sim.Domain
 	globalStorage     *mem.Storage
 	rdmaAddressMapper *mem.BankedAddressPortMapper
-
-	opticalConnector  *optical.Connector         // Referencia al CONECTOR óptico.
-	networkController *optical.NetworkController // Referencia al CONTROLLER.
 }
 
 // MakeBuilder creates a new Builder with default parameters.
@@ -177,17 +172,33 @@ func (b *Builder) createGPUs(
 	gpuDriver *driver.Driver,
 	pmcAddressTable *mem.BankedAddressPortMapper,
 ) {
+	// Dimensiones de la topología (dinámico).
+	numGPUsFloat := float64(b.numGPUs)
+	numRows := int(math.Ceil(math.Sqrt(numGPUsFloat)))
+	numCols := int(math.Ceil(numGPUsFloat / float64(numRows)))
 
-	// Topología de Red.
-	lastSwitchID := rootComplexID
-	for i := 1; i < b.numGPUs+1; i++ {
-		if i%2 == 1 { // Por cada 2 GPUs se crea un nuevo switch PCIe (conectado al Root Complex).
-			lastSwitchID = pcieConnector.AddSwitch(rootComplexID)
+	// Todos los switches estarán conectados al Root Complex.
+	rowSwitches := make([]int, numRows)
+	for i := 0; i < numRows; i++ {
+		rowSwitches[i] = pcieConnector.AddSwitch(rootComplexID)
+	}
+
+	// Crear GPUs y conectarlas a su switch de fila.
+	gpuID := 1
+	for r := 0; r < numRows; r++ {
+		for c := 0; c < numCols; c++ {
+
+			// Salir si ya hemos creado todas las GPUs
+			if gpuID > b.numGPUs {
+				break
+			}
+
+			// Conectar esta GPU al switch de su fila
+			b.createGPU(gpuID, gpuBuilder, gpuDriver, pmcAddressTable,
+				pcieConnector, rowSwitches[r])
+
+			gpuID++
 		}
-
-		// Se conectan esas 2 GPUs al switch recién creado.
-		b.createGPU(i, gpuBuilder, gpuDriver, pmcAddressTable,
-			pcieConnector, lastSwitchID)
 	}
 }
 
@@ -231,56 +242,6 @@ func (b *Builder) createConnection(
 			mmuComponent.GetPortByName("Top"),
 		})
 
-	// --- RED ÓPTICA ---
-	// No necesitamos crear un "Root Complex" óptico porque es P2P.
-	fmt.Println("[DEBUG_BUILDER] Creating Optical Network...")
-
-	// 1. Instanciar Connector (Switch + Link).
-	b.opticalConnector = optical.NewConnector(b.simulation)
-	b.simulation.RegisterComponent(b.opticalConnector.Switch)
-
-	found := false
-	for _, c := range b.simulation.Components() {
-		if c.Name() == "OpticalSwitch" {
-			found = true
-			break
-		}
-	}
-	if found {
-		fmt.Println("[DEBUG_BUILDER] ÉXITO: OpticalSwitch ENCONTRADO en la lista de componentes.")
-	} else {
-		fmt.Println("[DEBUG_BUILDER] ERROR: OpticalSwitch NO ENCONTRADO en la lista de componentes.")
-	}
-
-	// 2. Instanciar Predictor.
-	Predictor := &optical.MaxTrafficPredictor{}
-
-	// 3. Instanciar Controlador.
-	// Frecuencia: 100 KHz = Revisa cada 10 microsegs.
-	b.networkController = optical.NewNetworkController(
-		"OpticalController",
-		b.simulation.GetEngine(),
-		b.opticalConnector.Switch,
-		Predictor,
-		b.opticalConnector.AllLinks,
-		100*sim.KHz,
-	)
-	b.simulation.RegisterComponent(b.networkController)
-	fmt.Println("[DEBUG_BUILDER] Optical Network created.")
-
-	found = false
-	for _, c := range b.simulation.Components() {
-		if c.Name() == "OpticalController" {
-			found = true
-			break
-		}
-	}
-	if found {
-		fmt.Println("[DEBUG_BUILDER] ÉXITO: OpticalController ENCONTRADO en la lista de componentes.")
-	} else {
-		fmt.Println("[DEBUG_BUILDER] ERROR: OpticalController NO ENCONTRADO en la lista de componentes.")
-	}
-
 	return pcieConnector, rootComplexID
 }
 
@@ -300,7 +261,7 @@ func (b *Builder) createGPU(
 	pcieSwitchID int,
 ) *sim.Domain {
 	name := fmt.Sprintf("GPU[%d]", index)
-	memAddrOffset := uint64(index) * b.gpuMemSize // Dinámico!
+	memAddrOffset := uint64(index) * 4 * mem.GB // Asigna un desplazamiento de dirección de memoria
 	gpu := gpuBuilder.
 		WithGPUID(uint64(index)).
 		WithMemAddrOffset(memAddrOffset).
@@ -311,43 +272,17 @@ func (b *Builder) createGPU(
 		gpu.GetPortByName("CommandProcessor"),
 		driver.DeviceProperties{
 			CUCount:  b.numCUPerSA * b.numSAPerGPU,
-			DRAMSize: b.gpuMemSize,
+			DRAMSize: 4 * mem.GB,
 		},
 	)
 	// gpu.CommandProcessor.Driver = gpuDriver.GetPortByName("GPU")
 
 	b.configRDMAEngine(gpu)
-	b.configPMC(gpu, gpuDriver, pmcAddressTable)
+	// b.configPMC(gpu, gpuDriver, pmcAddressTable)
 
-	// pcieConnector.PlugInDevice(pcieSwitchID, gpu.Ports())
+	pcieConnector.PlugInDevice(pcieSwitchID, gpu.Ports())
 
-	// 1. Obtenemos TODOS los puertos de la GPU.
-	ports := gpu.Ports()
-	var pciePorts []sim.Port
-
-	fmt.Printf("[DEBUG_BUILDER] Configurando puertos para GPU %d:\n", index)
-
-	// 2. Clasificamos los puertos por red:
-	// [1] Control (PCIe) o [2] Datos (Óptico).
-	for _, p := range ports {
-		fmt.Printf("   - Puerto analizado: '%s' -> ", p.Name())
-
-		// En r9nano/builder.go los puertos del RDMA son:
-		isRDMAReq := strings.Contains(p.Name(), "RDMARequest")
-		isRDMAData := strings.Contains(p.Name(), "RDMAData")
-
-		if isRDMAReq || isRDMAData {
-			fmt.Println("RED ÓPTICA")
-			b.opticalConnector.PlugIn(p) // [2] Conexión a la red óptica.
-		} else {
-			fmt.Println("RED PCIE")
-			// [1] Conectar a PCIe ("CommandProcessor", "MMU", etc.)
-			pciePorts = append(pciePorts, p)
-		}
-	}
-
-	// 3. Enchufar puertos de CONTROL a su Switch PCIe.
-	pcieConnector.PlugInDevice(pcieSwitchID, pciePorts)
+	// b.gpus = append(b.gpus, gpu)
 
 	return gpu
 }
@@ -360,17 +295,15 @@ func (b *Builder) configRDMAEngine(
 		gpu.GetPortByName("RDMAData").AsRemote())
 }
 
-func (b *Builder) configPMC(
-	gpu *sim.Domain,
-	gpuDriver *driver.Driver,
-	addrTable *mem.BankedAddressPortMapper,
-) {
-	pmcPort := gpu.GetPortByName("PageMigrationController")
-
-	addrTable.LowModules = append(
-		addrTable.LowModules,
-		pmcPort.AsRemote())
-
-	gpuDriver.RemotePMCPorts = append(
-		gpuDriver.RemotePMCPorts, pmcPort)
-}
+// func (b *Builder) configPMC(
+// 	gpu *GPU,
+// 	gpuDriver *driver.Driver,
+// 	addrTable *mem.BankedAddressPortMapper,
+// ) {
+// 	gpu.PMC.RemotePMCAddressTable = addrTable
+// 	addrTable.LowModules = append(
+// 		addrTable.LowModules,
+// 		gpu.PMC.GetPortByName("Remote").AsRemote())
+// 	gpuDriver.RemotePMCPorts = append(
+// 		gpuDriver.RemotePMCPorts, gpu.PMC.GetPortByName("Remote"))
+// }

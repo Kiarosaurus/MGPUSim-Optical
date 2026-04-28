@@ -38,23 +38,19 @@ func (p *OpticalPacket) Clone() sim.Msg {
 // --- DEFINICIÓN DEL COMPONENTE SWITCH ---
 
 type Switch struct {
-	*sim.TickingComponent // Habilitando un reloj. ES COMPONENTE.
-
-	Latency sim.VTimeInSec // Habilitando Latencia.
-
-	// Mapea ID de DESTINO (String) -> Puerto de SALIDA (Objeto).
-	// TODO. Que sea modificada dinámicamente por el Controller.
-	RouteTable map[sim.RemotePort]sim.Port
+	*sim.TickingComponent                // Habilitando un reloj. ES COMPONENTE.
+	Latency               sim.VTimeInSec // Habilitando Latencia.
 
 	connectedPorts []sim.Port
+	PhysicalMap    map[sim.RemotePort]sim.Port // Indica las conexiones físicas nodo->Port.
 
-	// Recolectamos quién habla con quién (Source -> Destination -> Bytes).
-	// TODO. Que la use el predictor.
+	// Mapea ID de DESTINO (String) -> Puerto de SALIDA (Objeto).
+	RouteTable map[sim.RemotePort]sim.Port
+	routeLock  sync.RWMutex
+
+	// Mapea quién habla con quién (Source -> Destination -> Bytes).
 	TrafficMatrix map[string]map[string]uint64
-	matrixLock    sync.Mutex // Lock. La usará el Switch (escribir) + Controller (leer).
-
-	// TODO.
-	// Parte de RECONFIGURACIÓN.
+	matrixLock    sync.Mutex
 }
 
 func NewSwitch(name string, engine sim.Engine) *Switch {
@@ -62,6 +58,7 @@ func NewSwitch(name string, engine sim.Engine) *Switch {
 		TickingComponent: sim.NewTickingComponent(name, engine, 1*sim.GHz, nil),
 		Latency:          40 * 1e-9, // (~40ns según Flexfly).
 		RouteTable:       make(map[sim.RemotePort]sim.Port),
+		PhysicalMap:      make(map[sim.RemotePort]sim.Port),
 		TrafficMatrix:    make(map[string]map[string]uint64),
 	}
 	return s
@@ -87,40 +84,43 @@ const OutputBufferCapacity = 16 // Prevenimos deadlock.
 
 func (s *Switch) CreatePort(name string) sim.Port {
 	port := sim.NewPort(s, InputBufferCapacity, OutputBufferCapacity, name)
-	s.connectedPorts = append(s.connectedPorts, port) // Pa la lista de connected ports.
+	s.connectedPorts = append(s.connectedPorts, port)
 	return port
 }
 
-// Configuración de la tabla de enrutamiento estática inicial.
+// Registra la conexión física (estática) + ruta lógica inicial (dinámica).
 func (s *Switch) RegisterDestination(dstName sim.RemotePort, outputPort sim.Port) {
-	// TODO. El Controlador debe modificar dinámicamente esto.
-	s.RouteTable[dstName] = outputPort
+	s.routeLock.Lock()
+	defer s.routeLock.Unlock()
+
+	s.PhysicalMap[dstName] = outputPort // Físico.
+	s.RouteTable[dstName] = outputPort  // Lógico.
 }
 
 // --- LÓGICA PRINCIPAL DEL SWITCH ---
-func (s *Switch) ProcessMsg(now sim.VTimeInSec, msg sim.Msg) {
-	// TODO. Verificar en caso haya RECONFIGURACIÓN.
-	// Podríamos descartar paquetes o ponerlos en buffers.
-
+func (s *Switch) ProcessMsg(now sim.VTimeInSec, msg sim.Msg, inPort sim.Port) bool {
 	dst := msg.Meta().Dst
 	src := msg.Meta().Src
 
-	// 1. Registrar Tráfico (para el predictor).
-	s.RecordTraffic(now, src, dst, msg)
-
-	// 2. Enrutar.
+	// 1. Enrutar.
+	s.routeLock.RLock()
 	outPort, found := s.RouteTable[dst]
+	s.routeLock.RUnlock()
+
 	if !found { // Destino inexistente en la RouteTable.
 		log.Panicf("[OPTICAL_SWITCH] Panic: No route from %s to %s", src, dst)
 	}
 
 	// 3. Verificando congestión de la salida.
 	if !outPort.CanSend() {
-		fmt.Printf("[OPTICAL_SWITCH] DROP! Port %s full sending to %s\n", outPort.Name(), dst)
-		return
+		return false // backpressure.
 	}
 
-	// 4. Reenviar (+ encapsulamiento).
+	inPort.RetrieveIncoming()
+	// 4. Registrar Tráfico (para el predictor).
+	s.RecordTraffic(now, src, dst, msg)
+
+	// 5. Reenviar (+ encapsulamiento).
 	packet := &OpticalPacket{
 		MsgMeta: sim.MsgMeta{
 			ID:           sim.GetIDGenerator().Generate(), // Generamos ID válido
@@ -134,6 +134,7 @@ func (s *Switch) ProcessMsg(now sim.VTimeInSec, msg sim.Msg) {
 
 	// Poniendo el packet en el buffer de salida -> el Port avisa al Link.
 	outPort.Send(packet)
+	return true
 }
 
 // --- EXTRACIÓN DE MÉTRICAS (tráfico) ---
@@ -150,7 +151,6 @@ func (s *Switch) RecordTraffic(now sim.VTimeInSec, src, dst sim.RemotePort, msg 
 		size = 8 // Arquitectura de 64 bits = 8 Bytes.
 		typeStr = "ReadReq"
 	case *mem.WriteReq:
-		size = uint64(len(m.Data))
 		typeStr = "WriteReq"
 	case *mem.DataReadyRsp:
 		size = uint64(len(m.Data))
@@ -172,23 +172,68 @@ func (s *Switch) RecordTraffic(now sim.VTimeInSec, src, dst sim.RemotePort, msg 
 		now, typeStr, src, dst, size)
 }
 
+// --- LÓGICA DE RECONFIGURACIÓN ---
+
+func (s *Switch) GetAndResetTrafficMatrix() TrafficPattern {
+	s.matrixLock.Lock()
+	defer s.matrixLock.Unlock()
+
+	// 1. Tomamos el mapa actual (con data).
+	oldMatrix := s.TrafficMatrix
+
+	// 2. Reseteamos el actual.
+	s.TrafficMatrix = make(map[string]map[string]uint64)
+
+	// 3. Devolvemos el viejo al controlador.
+	return oldMatrix
+}
+
+// Actualiza la tabla de rutas.
+func (s *Switch) TopologyUpdate(topology map[string]string) {
+	s.routeLock.Lock()
+	defer s.routeLock.Unlock()
+
+	fmt.Println("[SWITCH] --- Reconfiguring Routes ---")
+
+	for srcStr, dstStr := range topology {
+		dstPortID := sim.RemotePort(dstStr)
+		physicalPort, ok := s.PhysicalMap[dstPortID]
+
+		if ok {
+			// Establecemos la ruta lógica hacia el port correcto.
+			s.RouteTable[dstPortID] = physicalPort
+			fmt.Printf("[SWITCH] Route Enabled: Any -> %s via %s\n", dstStr, physicalPort.Name())
+		} else {
+			fmt.Printf("[SWITCH] ERROR!: Predictor requested route to unknown node %s\n", dstStr)
+		}
+		_ = srcStr // Para evitar error.
+	}
+}
+
 // --- REQUISITOS COMO COMPONENT: SWITCH ---
 // Akita llama automáticamente cuando un Link deja algo en un inputPort.
 func (s *Switch) NotifyRecv(port sim.Port) {
 	now := s.Engine.CurrentTime()
 
-	for { // Mientras hayan mensajes, procesa todos.
-		req := port.RetrieveIncoming()
+	for { // Mientras hayan mensajes, INTENTA procesar todos.
+		req := port.PeekIncoming() // Espiamos, sin sacar.
 		if req == nil {
-			return
+			return // Buffer input vacío.
 		}
 
-		s.ProcessMsg(now, req)
+		success := s.ProcessMsg(now, req, port)
+		if !success {
+			return // Backpressure activo.
+		}
 	}
 }
 
+// Llamado cuando un puerto LLENO libera al >=1 slot.
 func (s *Switch) NotifyPortFree(port sim.Port) {
-	// No-op.
+	// Avisamos a todos los puertos conectados.
+	for _, inPort := range s.connectedPorts {
+		s.NotifyRecv(inPort)
+	}
 }
 
 func (s *Switch) Handle(e sim.Event) error {
