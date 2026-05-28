@@ -2,240 +2,222 @@ package optical
 
 import (
 	"fmt"
-	"log"
-	"sync"
+	"math"
 
-	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/sim"
+	"github.com/sarchlab/akita/v4/tracing"
 )
 
-// --- DEFINICIÓN DEL WRAPPER ---
-
-// Wrapper para los mensajes de Akita en el Switch.
-// Motivo: Akita fuerza a que quien envía tiene que ser el firmante.
-// Este Wrapper nos ayuda a que el Switch firme el paquete.
+// OpticalPacket re-firma un mensaje reenviado para que el puerto de salida del Switch
+// sea el remitente declarado. Akita valida que Src coincida con el puerto emisor,
+// por lo que el Switch debe envolver el mensaje original en lugar de mutar su Src.
 type OpticalPacket struct {
-	sim.MsgMeta         // Metadata (ID, Src, Dst).
-	InnerMsg    sim.Msg // Mensaje real.
+	sim.MsgMeta
+	InnerMsg sim.Msg
 }
 
-// Requisito de interfaz sim.Msg
-func (p *OpticalPacket) Meta() *sim.MsgMeta {
-	return &p.MsgMeta
-}
+func (p *OpticalPacket) Meta() *sim.MsgMeta { return &p.MsgMeta }
 
-// Requisito de interfaz sim.Msg
 func (p *OpticalPacket) Clone() sim.Msg {
-	newPacket := *p
-	newPacket.ID = sim.GetIDGenerator().Generate()
-	// Clonamos el mensaje interno para (evitar race condition).
+	n := *p
+	n.ID = sim.GetIDGenerator().Generate()
 	if p.InnerMsg != nil {
-		newPacket.InnerMsg = p.InnerMsg.Clone()
+		n.InnerMsg = p.InnerMsg.Clone()
 	}
-	return &newPacket
+	return &n
 }
 
-// --- DEFINICIÓN DEL COMPONENTE SWITCH ---
+// ReconfigCompleteEvent es programado por el Switch cuando inicia la
+// reconfiguración óptica para un destino. Se dispara después de SwitchingDelay.
+type ReconfigCompleteEvent struct {
+	sim.EventBase
+	Dst    sim.RemotePort
+	TaskID string
+}
 
+type linkState int
+
+const (
+	linkConnected     linkState = iota // photonic path activo; mensajes fluyen
+	linkReconfiguring                  // switching en progreso; mensajes en stall
+)
+
+type linkEntry struct {
+	state   linkState
+	outPort sim.Port
+}
+
+// InputBufferCapacity está dimensionado para absorber el máximo de datos en vuelo durante una
+// ventana de reconfiguración de 820 ns a 32 GB/s: ~26 KB / 64 B por paquete =~ 410.
+const InputBufferCapacity = 512
+const OutputBufferCapacity = 16
+
+// Switch es un switch óptico dinámicamente reconfigurable. Toda la lógica de ruteo y
+// el estado de reconfiguración son autocontenidos; no se requiere un Controller o Predictor
+// externo. La reconfiguración se activa on-demand: el primer mensaje para un destino
+// desconocido o IDLE inicia un ReconfigCompleteEvent
+// programado en currentTime + SwitchingDelay.
 type Switch struct {
-	*sim.TickingComponent                // Habilitando un reloj. ES COMPONENTE.
-	Latency               sim.VTimeInSec // Habilitando Latencia.
+	*sim.TickingComponent
+	SwitchingDelay sim.VTimeInSec
 
 	connectedPorts []sim.Port
-	PhysicalMap    map[sim.RemotePort]sim.Port // Indica las conexiones físicas nodo->Port.
-
-	// Mapea ID de DESTINO (String) -> Puerto de SALIDA (Objeto).
-	RouteTable map[sim.RemotePort]sim.Port
-	routeLock  sync.RWMutex
-
-	// Mapea quién habla con quién (Source -> Destination -> Bytes).
-	TrafficMatrix map[string]map[string]uint64
-	matrixLock    sync.Mutex
+	PhysicalMap    map[sim.RemotePort]sim.Port   // dst -> puerto de salida físico (estático)
+	linkStates     map[sim.RemotePort]*linkEntry // dst -> estado actual del enlace (dinámico)
 }
 
-func NewSwitch(name string, engine sim.Engine) *Switch {
+// NewSwitch construye un switch óptico con reconfiguración on-demand.
+// switchingDelay es el tiempo de switching fotónico (p. ej., 820 ns para conmutación MZI).
+func NewSwitch(name string, engine sim.Engine, switchingDelay sim.VTimeInSec) *Switch {
 	s := &Switch{
-		TickingComponent: sim.NewTickingComponent(name, engine, 1*sim.GHz, nil),
-		Latency:          40 * 1e-9, // (~40ns según Flexfly).
-		RouteTable:       make(map[sim.RemotePort]sim.Port),
-		PhysicalMap:      make(map[sim.RemotePort]sim.Port),
-		TrafficMatrix:    make(map[string]map[string]uint64),
+		SwitchingDelay: switchingDelay,
+		PhysicalMap:    make(map[sim.RemotePort]sim.Port),
+		linkStates:     make(map[sim.RemotePort]*linkEntry),
 	}
+	s.TickingComponent = sim.NewSecondaryTickingComponent(name, engine, 1*sim.GHz, s)
 	return s
 }
 
-// --- ¿BUFFER ÓPTICO? ---
-
-// En Anderson et al. y Zhu et al. los switches ópticos son Bufferless.
-
-// Tiempo de reconfiguración (Anderson et al.): 820 ns.
-// Ancho de banda: 32 GB/s.	 <- En PCIe 4 se usan 16 lanes, con una velocidad de 1.969 GB/s.
-// 								Entonces el bandwidth es: 1,969 GB/s * 16 lanes = 31,504 GB/s.
-// -> DATOS ACUMULADOS: 32 GB/s * 820 ns ~= 26,240 KB.
-
-// Datos por paquete: 64 bytes.
-// -> SLOTS NECESARIOS: 26,240KB / 64B = aprox 410 slots.
-
-const InputBufferCapacity = 512 // Por tener seguridad.
-
-// La luz no espera, no se encola en la salida (debe ser 0).
-// Akita requiere >0 para pasar el mensaje de Switch al cable.
-const OutputBufferCapacity = 16 // Prevenimos deadlock.
-
+// CreatePort agrega un puerto de entrada/salida al switch.
 func (s *Switch) CreatePort(name string) sim.Port {
 	port := sim.NewPort(s, InputBufferCapacity, OutputBufferCapacity, name)
 	s.connectedPorts = append(s.connectedPorts, port)
 	return port
 }
 
-// Registra la conexión física (estática) + ruta lógica inicial (dinámica).
-func (s *Switch) RegisterDestination(dstName sim.RemotePort, outputPort sim.Port) {
-	s.routeLock.Lock()
-	defer s.routeLock.Unlock()
-
-	s.PhysicalMap[dstName] = outputPort // Físico.
-	s.RouteTable[dstName] = outputPort  // Lógico.
+// RegisterDestination registra el puerto de salida físico para dst y marca el
+// enlace como CONNECTED inmediatamente (ruta preconfigurada, sin reconfig al primer uso).
+// Usar cuando el photonic path ya está establecido antes de la simulación.
+func (s *Switch) RegisterDestination(dst sim.RemotePort, outPort sim.Port) {
+	s.PhysicalMap[dst] = outPort
+	s.linkStates[dst] = &linkEntry{state: linkConnected, outPort: outPort}
 }
 
-// --- LÓGICA PRINCIPAL DEL SWITCH ---
-func (s *Switch) ProcessMsg(now sim.VTimeInSec, msg sim.Msg, inPort sim.Port) bool {
-	dst := msg.Meta().Dst
-	src := msg.Meta().Src
-
-	// 1. Enrutar.
-	s.routeLock.RLock()
-	outPort, found := s.RouteTable[dst]
-	s.routeLock.RUnlock()
-
-	if !found { // Destino inexistente en la RouteTable.
-		log.Panicf("[OPTICAL_SWITCH] Panic: No route from %s to %s", src, dst)
-	}
-
-	// 3. Verificando congestión de la salida.
-	if !outPort.CanSend() {
-		return false // backpressure.
-	}
-
-	inPort.RetrieveIncoming()
-	// 4. Registrar Tráfico (para el predictor).
-	s.RecordTraffic(now, src, dst, msg)
-
-	// 5. Reenviar (+ encapsulamiento).
-	packet := &OpticalPacket{
-		MsgMeta: sim.MsgMeta{
-			ID:           sim.GetIDGenerator().Generate(), // Generamos ID válido
-			Src:          outPort.AsRemote(),              // Switch firma como remitente.
-			Dst:          dst,                             // Destino final se mantiene para el Link.
-			TrafficBytes: 16,                              // ID del Paquete (8B) + Origen (4B) + Destino (4B).
-			TrafficClass: "OpticalPacket",
-		},
-		InnerMsg: msg, // El mensaje es el original.
-	}
-
-	// Poniendo el packet en el buffer de salida -> el Port avisa al Link.
-	outPort.Send(packet)
-	return true
+// RegisterRoute registra únicamente el puerto de salida físico para dst sin
+// preconectar el enlace. El primer mensaje a este destino disparará la
+// reconfiguración on-demand (y emitirá el trace task optical_reconfig).
+// Usar para cualquier ruta que deba modelar la circuit-setup latency inicial del OCS.
+func (s *Switch) RegisterRoute(dst sim.RemotePort, outPort sim.Port) {
+	s.PhysicalMap[dst] = outPort
 }
 
-// --- EXTRACIÓN DE MÉTRICAS (tráfico) ---
-func (s *Switch) RecordTraffic(now sim.VTimeInSec, src, dst sim.RemotePort, msg sim.Msg) {
-	s.matrixLock.Lock()         // Tomamos el lock o esperamos.
-	defer s.matrixLock.Unlock() // Devolvemos cuando termine la func.
-
-	size := uint64(1)
-	typeStr := "Unknown"
-
-	// Para saber cuánto pesa cada mensaje, depende de su tipo.
-	switch m := msg.(type) {
-	case *mem.ReadReq:
-		size = 8 // Arquitectura de 64 bits = 8 Bytes.
-		typeStr = "ReadReq"
-	case *mem.WriteReq:
-		typeStr = "WriteReq"
-	case *mem.DataReadyRsp:
-		size = uint64(len(m.Data))
-		typeStr = "DataReady"
-	case *mem.WriteDoneRsp:
-		typeStr = "WriteDone"
-	}
-
-	srcName := string(src)
-	dstName := string(dst)
-
-	// Inicialización del mapa.
-	if _, ok := s.TrafficMatrix[srcName]; !ok {
-		s.TrafficMatrix[srcName] = make(map[string]uint64)
-	}
-	s.TrafficMatrix[srcName][dstName] += size
-
-	fmt.Printf("[SWITCH_MONITOR] Time: %.6f | %s (%s) -> %s | Size: %d bytes\n",
-		now, typeStr, src, dst, size)
+// EvictLink elimina la entrada lógica para dst de modo que el próximo mensaje a ese
+// destino dispare la reconfiguración on-demand. Usar en tests o benchmarks
+// para simular un enlace que fue reclamado para un photonic path diferente.
+func (s *Switch) EvictLink(dst sim.RemotePort) {
+	delete(s.linkStates, dst)
 }
 
-// --- LÓGICA DE RECONFIGURACIÓN ---
-
-func (s *Switch) GetAndResetTrafficMatrix() TrafficPattern {
-	s.matrixLock.Lock()
-	defer s.matrixLock.Unlock()
-
-	// 1. Tomamos el mapa actual (con data).
-	oldMatrix := s.TrafficMatrix
-
-	// 2. Reseteamos el actual.
-	s.TrafficMatrix = make(map[string]map[string]uint64)
-
-	// 3. Devolvemos el viejo al controlador.
-	return oldMatrix
-}
-
-// Actualiza la tabla de rutas.
-func (s *Switch) TopologyUpdate(topology map[string]string) {
-	s.routeLock.Lock()
-	defer s.routeLock.Unlock()
-
-	fmt.Println("[SWITCH] --- Reconfiguring Routes ---")
-
-	for srcStr, dstStr := range topology {
-		dstPortID := sim.RemotePort(dstStr)
-		physicalPort, ok := s.PhysicalMap[dstPortID]
-
-		if ok {
-			// Establecemos la ruta lógica hacia el port correcto.
-			s.RouteTable[dstPortID] = physicalPort
-			fmt.Printf("[SWITCH] Route Enabled: Any -> %s via %s\n", dstStr, physicalPort.Name())
-		} else {
-			fmt.Printf("[SWITCH] ERROR!: Predictor requested route to unknown node %s\n", dstStr)
+// Tick drena todos los puertos de entrada en orden round-robin.
+func (s *Switch) Tick() bool {
+	madeProgress := false
+	for _, port := range s.connectedPorts {
+		if s.processPort(port) {
+			madeProgress = true
 		}
-		_ = srcStr // Para evitar error.
+	}
+	return madeProgress
+}
+
+// processPort reenvía el mensaje cabeza de inPort si el enlace está CONNECTED.
+// Retorna ante el primer stall (dst desconocido, RECONFIGURING, o salida llena).
+func (s *Switch) processPort(inPort sim.Port) bool {
+	madeProgress := false
+	for {
+		msg := inPort.PeekIncoming()
+		if msg == nil {
+			return madeProgress
+		}
+
+		dst := msg.Meta().Dst
+		entry, exists := s.linkStates[dst]
+
+		if !exists {
+			physPort, ok := s.PhysicalMap[dst]
+			if !ok {
+				fmt.Printf("[SWITCH] Unknown dst %s — dropping msg\n", dst)
+				inPort.RetrieveIncoming()
+				continue
+			}
+			s.startReconfig(dst, physPort)
+			return madeProgress
+		}
+
+		if entry.state == linkReconfiguring {
+			return madeProgress
+		}
+
+		outPort := entry.outPort
+		if !outPort.CanSend() {
+			return madeProgress
+		}
+
+		inPort.RetrieveIncoming()
+
+		packet := &OpticalPacket{
+			MsgMeta: sim.MsgMeta{
+				ID:           sim.GetIDGenerator().Generate(),
+				Src:          outPort.AsRemote(),
+				Dst:          dst,
+				TrafficBytes: 16,
+				TrafficClass: "OpticalPacket",
+			},
+			InnerMsg: msg,
+		}
+		outPort.Send(packet)
+		madeProgress = true
 	}
 }
 
-// --- REQUISITOS COMO COMPONENT: SWITCH ---
-// Akita llama automáticamente cuando un Link deja algo en un inputPort.
-func (s *Switch) NotifyRecv(port sim.Port) {
+func (s *Switch) startReconfig(dst sim.RemotePort, physPort sim.Port) {
 	now := s.Engine.CurrentTime()
+	taskID := sim.GetIDGenerator().Generate()
 
-	for { // Mientras hayan mensajes, INTENTA procesar todos.
-		req := port.PeekIncoming() // Espiamos, sin sacar.
-		if req == nil {
-			return // Buffer input vacío.
-		}
+	s.linkStates[dst] = &linkEntry{state: linkReconfiguring, outPort: physPort}
 
-		success := s.ProcessMsg(now, req, port)
-		if !success {
-			return // Backpressure activo.
-		}
-	}
+	tracing.StartTask(taskID, "", s, "reconfig", "optical_reconfig", nil)
+
+	evt := ReconfigCompleteEvent{}
+	delayCycles := int(math.Round(float64(s.SwitchingDelay) * float64(s.Freq)))
+	fireAt := s.Freq.NCyclesLater(delayCycles, now)
+	evt.EventBase = *sim.NewEventBase(fireAt, s)
+	evt.Dst = dst
+	evt.TaskID = taskID
+	s.Engine.Schedule(evt)
+
+	fmt.Printf("[SWITCH] t=%.9fs  RECONFIG_START  dst=%s  delay=%.9fs\n",
+		float64(now), dst, float64(s.SwitchingDelay))
 }
 
-// Llamado cuando un puerto LLENO libera al >=1 slot.
-func (s *Switch) NotifyPortFree(port sim.Port) {
-	// Avisamos a todos los puertos conectados.
-	for _, inPort := range s.connectedPorts {
-		s.NotifyRecv(inPort)
-	}
+func (s *Switch) handleReconfigComplete(e ReconfigCompleteEvent) error {
+	entry := s.linkStates[e.Dst]
+	entry.state = linkConnected
+	tracing.EndTask(e.TaskID, s)
+
+	now := s.Engine.CurrentTime()
+	fmt.Printf("[SWITCH] t=%.9fs  RECONFIG_END  dst=%s\n", float64(now), e.Dst)
+
+	s.TickNow()
+	return nil
 }
 
+// Handle intercepta ReconfigCompleteEvents despachados a s.
+// Los TickEvents son manejados por el TickingComponent embebido (handler = tc) y
+// nunca llegan a este método; invocan s.Tick() a través del ticker pointer almacenado.
 func (s *Switch) Handle(e sim.Event) error {
-	return s.TickingComponent.Handle(e)
+	if evt, ok := e.(ReconfigCompleteEvent); ok {
+		return s.handleReconfigComplete(evt)
+	}
+	if s.Tick() {
+		s.TickLater()
+	}
+	return nil
+}
+
+func (s *Switch) NotifyRecv(_ sim.Port) {
+	s.TickNow()
+}
+
+func (s *Switch) NotifyPortFree(_ sim.Port) {
+	s.TickNow()
 }
