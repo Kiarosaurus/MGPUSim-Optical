@@ -68,6 +68,10 @@ func (r *Runner) initSimulation() {
 		builder = builder.WithParallelEngine()
 	}
 
+	if *visTracerDBFileName != "" {
+		builder = builder.WithOutputFileName(*visTracerDBFileName)
+	}
+
 	r.simulation = builder.Build()
 }
 
