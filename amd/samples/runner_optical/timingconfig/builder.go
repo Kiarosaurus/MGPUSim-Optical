@@ -33,8 +33,7 @@ type Builder struct {
 	globalStorage     *mem.Storage
 	rdmaAddressMapper *mem.BankedAddressPortMapper
 
-	opticalConnector  *optical.Connector         // Referencia al CONECTOR óptico.
-	networkController *optical.NetworkController // Referencia al CONTROLLER.
+	opticalConnector *optical.Connector
 }
 
 // MakeBuilder creates a new Builder with default parameters.
@@ -252,35 +251,7 @@ func (b *Builder) createConnection(
 		fmt.Println("[DEBUG_BUILDER] ERROR: OpticalSwitch NO ENCONTRADO en la lista de componentes.")
 	}
 
-	// 2. Instanciar Predictor.
-	Predictor := &optical.MaxTrafficPredictor{}
-
-	// 3. Instanciar Controlador.
-	// Frecuencia: 100 KHz = Revisa cada 10 microsegs.
-	b.networkController = optical.NewNetworkController(
-		"OpticalController",
-		b.simulation.GetEngine(),
-		b.opticalConnector.Switch,
-		Predictor,
-		b.opticalConnector.AllLinks,
-		100*sim.KHz,
-	)
-	b.simulation.RegisterComponent(b.networkController)
 	fmt.Println("[DEBUG_BUILDER] Optical Network created.")
-
-	found = false
-	for _, c := range b.simulation.Components() {
-		if c.Name() == "OpticalController" {
-			found = true
-			break
-		}
-	}
-	if found {
-		fmt.Println("[DEBUG_BUILDER] ÉXITO: OpticalController ENCONTRADO en la lista de componentes.")
-	} else {
-		fmt.Println("[DEBUG_BUILDER] ERROR: OpticalController NO ENCONTRADO en la lista de componentes.")
-	}
-
 	return pcieConnector, rootComplexID
 }
 
