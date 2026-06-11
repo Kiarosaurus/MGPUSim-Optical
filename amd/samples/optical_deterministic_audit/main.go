@@ -93,8 +93,8 @@ const (
 	// drainDelay: guard window obligatorio antes de reconfigurar el MZI cuando un
 	// srcPort cambia de dst. Modela fotones en vuelo + transceiver settle time.
 	// TODO. Protocolo de drenado más realista.
-	drainDelay   sim.VTimeInSec = 21e-9
-	fiberLatency sim.VTimeInSec = 10e-9
+	drainDelay   sim.VTimeInSec = 1e-9
+	fiberLatency sim.VTimeInSec = 0
 
 	linkBandwidthGBs = 32.0 // GB/s reference (Flexfly)
 )

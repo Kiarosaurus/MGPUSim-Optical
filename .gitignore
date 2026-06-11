@@ -30,6 +30,7 @@ vendor
 __debug_bin
 
 samples/**/metrics.csv
+exps/
 
 test
 # Generated mocks (created via go:generate mockgen)

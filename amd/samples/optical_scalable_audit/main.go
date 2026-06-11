@@ -52,8 +52,8 @@ const (
 	switchingDelay sim.VTimeInSec = 820e-9
 	// drainDelay: guard window pre-reconfig. Sin tráfico de cambio de dst en
 	// este benchmark, el evento de drain nunca se programa.
-	drainDelay   sim.VTimeInSec = 21e-9
-	fiberLatency sim.VTimeInSec = 10e-9
+	drainDelay   sim.VTimeInSec = 1e-9
+	fiberLatency sim.VTimeInSec = 0
 )
 
 var numGPUs = flag.Int("gpus", 4, "number of GPUs in the ring (>= 2)")

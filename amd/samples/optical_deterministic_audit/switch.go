@@ -10,11 +10,20 @@ import (
 
 // LinkKey identifica de forma única un directed optical path (src->dst).
 type LinkKey struct {
-	Src sim.RemotePort
-	Dst sim.RemotePort
+	A sim.RemotePort
+	B sim.RemotePort
 }
 
-func (k LinkKey) String() string { return fmt.Sprintf("%s->%s", k.Src, k.Dst) }
+func (k LinkKey) String() string { return fmt.Sprintf("%s<->%s", k.A, k.B) }
+
+// canonKey normaliza el par a una clave no dirigida (orden lexicografico):
+// (A,B) y (B,A) producen exactamente la misma entrada, porque la fibra es full-duplex.
+func canonKey(a, b sim.RemotePort) LinkKey {
+	if string(a) > string(b) {
+		a, b = b, a
+	}
+	return LinkKey{A: a, B: b}
+}
 
 type linkState int
 
@@ -50,7 +59,7 @@ type auditSwitch struct {
 	// que ya tiene activo" -> trigger del drain. Si el srcPort nunca tuvo
 	// circuito (primer paquete), no aparece aquí y se llama a startReconfig
 	// directamente, sin drain.
-	currentDstBySrc map[sim.RemotePort]sim.RemotePort
+	peerByPort map[sim.RemotePort]sim.RemotePort
 }
 
 func newAuditSwitch(
@@ -68,7 +77,7 @@ func newAuditSwitch(
 		fiberCycles:     int(math.Round(float64(fiberDelay) * float64(switchFreq))),
 		portsByRemote:   make(map[sim.RemotePort]sim.Port),
 		linkStates:      make(map[LinkKey]linkState),
-		currentDstBySrc: make(map[sim.RemotePort]sim.RemotePort),
+		peerByPort:      make(map[sim.RemotePort]sim.RemotePort),
 	}
 	s.TickingComponent = sim.NewSecondaryTickingComponent(name, engine, switchFreq, s)
 	return s
@@ -153,8 +162,9 @@ func (s *auditSwitch) processOutgoing(srcPort sim.Port) bool {
 		return false
 	}
 
-	srcRemote := srcPort.AsRemote()
-	key := LinkKey{Src: srcRemote, Dst: head.Meta().Dst}
+	src := srcPort.AsRemote()
+	dst := head.Meta().Dst
+	key := canonKey(src, dst)
 
 	state, exists := s.linkStates[key]
 	if !exists {
@@ -164,22 +174,21 @@ func (s *auditSwitch) processOutgoing(srcPort sim.Port) bool {
 		//   B) Este srcPort YA tenía un circuito hacia otro dst: tenemos que
 		//      drenar primero (guard window) antes de reconfigurar el MZI, si no
 		//      cortamos a la mitad cualquier paquete que ya esté en la fibra.
-		oldDst, hadCircuit := s.currentDstBySrc[srcRemote]
+		peer, hadCircuit := s.peerByPort[src]
 		if !hadCircuit {
 			s.startReconfig(srcPort, key)
 			return false
 		}
-		oldKey := LinkKey{Src: srcRemote, Dst: oldDst}
-		s.startDrain(srcPort, oldKey, key)
+		s.startDrain(srcPort, canonKey(src, peer), key)
 		return false
 	}
 	if state == linkDraining || state == linkReconfiguring {
 		return false
 	}
 
-	dstPort, ok := s.portsByRemote[key.Dst]
+	dstPort, ok := s.portsByRemote[dst]
 	if !ok {
-		fmt.Printf("[Switch] unknown dst %s — dropping\n", key.Dst)
+		fmt.Printf("[Switch] unknown dst %s — dropping\n", dst)
 		srcPort.RetrieveOutgoing()
 		return true // drop también consume el ciclo
 	}
@@ -195,7 +204,8 @@ func (s *auditSwitch) processOutgoing(srcPort sim.Port) bool {
 
 	taskID := sim.GetIDGenerator().Generate()
 	tracing.StartTaskWithSpecificLocation(
-		taskID, "", s, "fiber_transit", "optical_fiber", key.String(), nil,
+		taskID, "", s, "fiber_transit", "optical_fiber",
+		fmt.Sprintf("%s->%s", src, dst), nil,
 	)
 
 	evt := FiberDeliverEvent{
@@ -257,6 +267,8 @@ func (s *auditSwitch) startDrain(
 // El TickNow al final de handleReconfigComplete lo procesará después.
 func (s *auditSwitch) handleDrainComplete(e DrainCompleteEvent) error {
 	delete(s.linkStates, e.OldKey)
+	delete(s.peerByPort, e.OldKey.A)
+	delete(s.peerByPort, e.OldKey.B)
 	tracing.EndTask(e.TaskID, s)
 
 	now := s.engine.CurrentTime()
@@ -290,7 +302,8 @@ func (s *auditSwitch) handleReconfigComplete(e ReconfigCompleteEvent) error {
 	s.linkStates[e.Key] = linkConnected
 	// Registrar el nuevo circuito activo para este srcPort. Necesario para que
 	// el próximo cambio de dst dispare drain y no reconfig directo.
-	s.currentDstBySrc[e.Key.Src] = e.Key.Dst
+	s.peerByPort[e.Key.A] = e.Key.B
+	s.peerByPort[e.Key.B] = e.Key.A
 	tracing.EndTask(e.TaskID, s)
 
 	now := s.engine.CurrentTime()

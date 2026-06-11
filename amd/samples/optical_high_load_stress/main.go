@@ -63,8 +63,13 @@ const (
 	// drainDelay: guard window obligatorio antes de reconfigurar el MZI cuando un
 	// srcPort cambia de dst. Modela fotones en vuelo + transceiver settle time.
 	// TODO. Protocolo de drenado más realista.
-	drainDelay   sim.VTimeInSec = 21e-9
-	fiberLatency sim.VTimeInSec = 10e-9
+	drainDelay   sim.VTimeInSec = 1e-9
+	fiberLatency sim.VTimeInSec = 0
+
+	// injectFreq pace la inyección de paquetes (1 paquete/ns). Los fireAt se
+	// calculan con NCyclesLater en ciclos enteros: sumar float64 (t + i*1e-9)
+	// acumula drift de ULPs y hace panic a engine.Schedule/TickNow.
+	injectFreq = 1 * sim.GHz
 )
 
 func main() {
@@ -101,7 +106,7 @@ func main() {
 				SeqNum:  i,
 				Phase:   3,
 			}
-			fireAt := t + sim.VTimeInSec(i)*1e-9
+			fireAt := injectFreq.NCyclesLater(i, t)
 			evt.EventBase = *sim.NewEventBase(fireAt, gpu1)
 			engine.Schedule(evt)
 		}
@@ -118,7 +123,7 @@ func main() {
 				SeqNum:  i,
 				Phase:   2,
 			}
-			fireAt := t + sim.VTimeInSec(i)*1e-9
+			fireAt := injectFreq.NCyclesLater(i, t)
 			evt.EventBase = *sim.NewEventBase(fireAt, gpu2)
 			engine.Schedule(evt)
 		}
@@ -131,7 +136,7 @@ func main() {
 			SeqNum:  i,
 			Phase:   1,
 		}
-		evt.EventBase = *sim.NewEventBase(sim.VTimeInSec(i)*1e-9, gpu1)
+		evt.EventBase = *sim.NewEventBase(injectFreq.NCyclesLater(i, 0), gpu1)
 		engine.Schedule(evt)
 	}
 

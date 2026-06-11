@@ -11,7 +11,7 @@ import (
 const defaultSwitchingDelay sim.VTimeInSec = 820e-9
 
 // fiberLatency modela una fibra intra-rack de 2 metros: t = 2 m / (3e8/1.5) m/s =~ 10 ns.
-const fiberLatency sim.VTimeInSec = 1e-8
+const fiberLatency sim.VTimeInSec = 0
 
 // Cada GPU/memory port se conecta a un puerto del Switch mediante un Link de fibra óptica.
 type Connector struct {
