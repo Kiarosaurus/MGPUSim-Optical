@@ -4,15 +4,24 @@ import (
 	"flag"
 	"math/rand"
 
+	"github.com/sarchlab/mgpusim/v4/amd/benchmarks"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/training_benchmarks/lenet"
-
-	"github.com/sarchlab/mgpusim/v4/amd/samples/runner"
+	"github.com/sarchlab/mgpusim/v4/amd/driver"
 )
 
+// topoRunner es la API mínima del runner
+// la plataforma la elige el build tag (ver runner_*.go).
+type topoRunner interface {
+	Driver() *driver.Driver
+	AddBenchmark(benchmarks.Benchmark)
+	Run()
+}
+
+// Flags de training con defaults mínimos para correr rápido en muchas GPUs.
 var epochFlag = flag.Int("epoch", 1, "Number of epoch to run.")
-var maxBatchPerEpochFlag = flag.Int("max-batch-per-epoch", 2,
-	"Number of epochs to run.")
-var batchSizeFlag = flag.Int("batch-size", 32,
+var maxBatchPerEpochFlag = flag.Int("max-batch-per-epoch", 1,
+	"Number of batches to run per epoch.")
+var batchSizeFlag = flag.Int("batch-size", 8,
 	"Number of images per batch")
 var enableTestingFlag = flag.Bool("enable-testing", false,
 	"If enable testing is set, the trainer will evaluate the trained model after each epoch")
@@ -25,7 +34,7 @@ func main() {
 	rand.Seed(1)
 	flag.Parse()
 
-	runner := new(runner.Runner).Init()
+	runner := newRunner()
 
 	benchmark := lenet.NewBenchmark(runner.Driver())
 	benchmark.Epoch = *epochFlag

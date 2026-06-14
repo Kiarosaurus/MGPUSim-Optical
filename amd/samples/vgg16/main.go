@@ -3,14 +3,23 @@ package main
 import (
 	"flag"
 
+	"github.com/sarchlab/mgpusim/v4/amd/benchmarks"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/training_benchmarks/vgg16"
-	"github.com/sarchlab/mgpusim/v4/amd/samples/runner"
+	"github.com/sarchlab/mgpusim/v4/amd/driver"
 )
 
+// topoRunner es la API mínima del runner; la plataforma la elige el build tag (ver runner_*.go).
+type topoRunner interface {
+	Driver() *driver.Driver
+	AddBenchmark(benchmarks.Benchmark)
+	Run()
+}
+
+// Flags de training con defaults mínimos para correr rápido en muchas GPUs.
 var epochFlag = flag.Int("epoch", 1, "Number of epoch to run.")
-var maxBatchPerEpochFlag = flag.Int("max-batch-per-epoch", 2,
-	"Number of epochs to run.")
-var batchSizeFlag = flag.Int("batch-size", 8,
+var maxBatchPerEpochFlag = flag.Int("max-batch-per-epoch", 1,
+	"Number of batches to run per epoch.")
+var batchSizeFlag = flag.Int("batch-size", 4,
 	"Number of images per batch")
 var enableTestingFlag = flag.Bool("enable-testing", false,
 	"If set, the trainer will evaluate the trained model after each epoch")
@@ -22,7 +31,7 @@ GPU-to-CPU memory copies.`)
 func main() {
 	flag.Parse()
 
-	runner := new(runner.Runner).Init()
+	runner := newRunner()
 
 	benchmark := vgg16.NewBenchmark(runner.Driver())
 	benchmark.Epoch = *epochFlag
