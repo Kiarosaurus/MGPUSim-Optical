@@ -27,6 +27,12 @@ def collapse_to_gpu(name):
     return m.group(1) if m else str(name)
 
 
+def is_gpu_node(name):
+    # True si el nombre pertenece a una GPU ('GPU[1]', 'GPU2.L2Cache[3]'...).
+    # Componentes globales del sistema (Driver, MMU, OpticalSwitch) -> False.
+    return bool(_GPU_RE.match(str(name)))
+
+
 def natural_key(name):
     # Clave de orden natural: GPU2 antes que GPU10.
     return [int(t) if t.isdigit() else t for t in _NAT_RE.split(str(name))]
@@ -152,12 +158,11 @@ def infer_reconfig_links(recs, trans, eps=2e-9):
 
 
 def detect_nodes(*event_frames):
-    # Nodos (GPUs) presentes: unión de src/dst de los frames, orden natural.
     names = set()
     for ev in event_frames:
         if ev is None or ev.empty:
             continue
         for col in ("src", "dst"):
             if col in ev.columns:
-                names.update(x for x in ev[col] if x)
+                names.update(x for x in ev[col] if x and is_gpu_node(x))
     return sorted(names, key=natural_key)
