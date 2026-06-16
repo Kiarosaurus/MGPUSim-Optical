@@ -283,7 +283,7 @@ func (b *Builder) createConnection(
 	// 3. Añadimos la CPU (Root Complex) a la red
 	rootComplexID := nvConnector.AddRootComplex(
 		[]sim.Port{
-			gpuDriver.GetPortByName("CPU"),
+			gpuDriver.GetPortByName("GPU"),
 			mmuComp.GetPortByName("Migration"),
 		})
 
