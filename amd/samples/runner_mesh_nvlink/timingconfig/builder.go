@@ -278,7 +278,7 @@ func (b *Builder) createConnection(
 		WithFrequency(1 * sim.GHz)
 
 	// 2. Creamos la red base
-	nvConnector.CreateNetwork("Supercomputer_Fabric")
+	nvConnector.CreateNetwork("SupercomputerFabric")
 
 	// 3. Añadimos la CPU (Root Complex) a la red
 	rootComplexID := nvConnector.AddRootComplex(
