@@ -6,9 +6,20 @@ GPU_LIST=$3
 OUT_DIR=$4
 NUM_GPUS=$5
 DO_COMPILE=$6
+COMPILE_ONLY=${7:-}   # no simula
 
-export GOMEMLIMIT="50GiB"
-export GOGC=20
+# Tunables (overridable desde sbatch).
+export GOMEMLIMIT="${GOMEMLIMIT:-50GiB}"    # RAM máxima que puede usar el proceso Go
+export GOGC="${GOGC:-20}"   # menor GOGC => más GC => menos RAM pero más lento.
+
+# GOMAXPROCS:
+# número de threads OS que el scheduler Go puede usar para ejecutar goroutines.
+# Pineamos con SLURM_CPUS_PER_TASK para usar todo el CPU asignado por SLURM.
+GOMAXPROCS="${GOMAXPROCS:-${SLURM_CPUS_PER_TASK:-}}"
+if [ -n "$GOMAXPROCS" ]; then
+    export GOMAXPROCS
+fi
+
 export PATH="$PATH:/usr/local/go/bin"
 
 # 1. Rutas exactas del código fuente
@@ -22,13 +33,32 @@ if [ ! -d "$BENCHMARK_DIR" ]; then
     exit 1
 fi
 
-# 2. Compilación: Guardamos el binario resultante en la carpeta OUT_DIR
+# 2. Compilación: binario -> OUT_DIR.
+BIN="$OUT_DIR/${BENCHMARK}_bin"
+
 if [ "$DO_COMPILE" -eq 1 ]; then
-    echo "     [Compilando] $BENCHMARK (Topología: $TOPOLOGY)..."
+    BUILD_TAGS=""
+    case "$TOPOLOGY" in
+        runner_fattree_pcie) BUILD_TAGS="fattree" ;;
+        runner_mesh_nvlink)  BUILD_TAGS="mesh" ;;
+    esac
+
+    echo "     [Compilando] $BENCHMARK (tags='${BUILD_TAGS:-default}')..."
     pushd "$BENCHMARK_DIR" > /dev/null || exit 1
-    go build -o "$OUT_DIR/${BENCHMARK}_bin"
+    if [ -n "$BUILD_TAGS" ]; then
+        go build -tags "$BUILD_TAGS" -o "$BIN"
+    else
+        go build -o "$BIN"
+    fi
+    build_rc=$?
     popd > /dev/null || exit 1
+    [ "$build_rc" -eq 0 ] || { echo "     [ERROR] build falló: $BENCHMARK"; exit 1; }
 fi
+
+[ -x "$BIN" ] || { echo "     [ERROR] no existe binario $BIN."; exit 1; }
+
+# compile-only
+[ "$COMPILE_ONLY" = "compile-only" ] && { echo "     [compile-only] listo: $BIN"; exit 0; }
 
 # 3. Argumentos de simulación
 #
@@ -54,6 +84,12 @@ if [[ "$BENCHMARK" == optical_* ]]; then
 else
     EXTRA_SIM_ARGS="-report-all -trace-vis -trace-vis-db sqlite -trace-vis-db-file ${TRACE_NAME}"
     SIM_ARGS="-timing $EXTRA_SIM_ARGS -gpus=$GPU_LIST"
+
+    # Motor de simulacion paralelo (multi-core). Default ON.
+    # PARALLEL=0 para ejecución serial.
+    if [ "${PARALLEL:-1}" -eq 1 ]; then
+        SIM_ARGS="$SIM_ARGS -parallel"
+    fi
 fi
 
 # 4. Ejecución
