@@ -284,7 +284,9 @@ func (b *Builder) createConnection(
 	rootComplexID := nvConnector.AddRootComplex(
 		[]sim.Port{
 			gpuDriver.GetPortByName("GPU"),
+			gpuDriver.GetPortByName("MMU"),
 			mmuComp.GetPortByName("Migration"),
+			mmuComp.GetPortByName("Top"),
 		})
 
 	return nvConnector, rootComplexID
